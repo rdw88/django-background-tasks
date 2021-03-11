@@ -62,6 +62,7 @@ class TaskManager(models.Manager):
                 ready = ready[:count]
             else:
                 ready = self.none()
+
         return ready
 
     def unlocked(self, now):
@@ -89,7 +90,7 @@ class TaskManager(models.Manager):
     def new_task(self, task_name, args=None, kwargs=None,
                  run_at=None, priority=0, queue=None, verbose_name=None,
                  creator=None, repeat=None, repeat_until=None,
-                 remove_existing_tasks=False):
+                 remove_existing_tasks=False, force_synchronous_execution=False):
         """
         If `remove_existing_tasks` is True, all unlocked tasks with the identical task hash will be removed.
         The attributes `repeat` and `repeat_until` are not supported at the moment.
@@ -113,6 +114,7 @@ class TaskManager(models.Manager):
                     creator=creator,
                     repeat=repeat or Task.NEVER,
                     repeat_until=repeat_until,
+                    force_synchronous_execution=force_synchronous_execution
                     )
 
     def get_task(self, task_name, args=None, kwargs=None):
@@ -166,6 +168,9 @@ class Task(models.Model):
     # the "name" of the queue this is to be run on
     queue = models.CharField(max_length=190, db_index=True,
                              null=True, blank=True)
+
+    # Overrides the BACKGROUND_TASK_RUN_ASYNC setting for this particular task
+    force_synchronous_execution = models.BooleanField()
 
     # how many times the task has been tried
     attempts = models.IntegerField(default=0, db_index=True)
@@ -224,6 +229,22 @@ class Task(models.Model):
             return Task.objects.get(pk=self.pk)
         return None
 
+    def unlock(self):
+        self.locked_by = None
+        self.locked_at = None
+
+        next_task = Task.objects.exclude(pk=self.pk).filter(
+            task_name=self.task_name,
+            run_at__gte=self.run_at
+        )
+
+        if next_task.exists():
+            self.run_at = next_task.earliest('run_at').run_at - timedelta(milliseconds=1)
+        else:
+            self.run_at = timezone.now()
+
+        self.save()
+
     def _extract_error(self, type, err, tb):
         file = StringIO()
         traceback.print_exception(type, err, tb, None, file)
@@ -239,6 +260,9 @@ class Task(models.Model):
 
     def is_repeating_task(self):
         return self.repeat > self.NEVER
+
+    def runs_async(self):
+        return not self.force_synchronous_execution and app_settings.BACKGROUND_TASK_RUN_ASYNC
 
     def reschedule(self, type, err, traceback):
         '''

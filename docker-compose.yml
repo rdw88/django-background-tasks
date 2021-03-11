@@ -1,0 +1,11 @@
+version: "3.8"
+
+services:
+  tasks:
+    build: .
+    command: bash
+    container_name: tasks
+    volumes:
+      - .:/tasks
+    stdin_open: true
+    tty: true

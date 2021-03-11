@@ -26,6 +26,7 @@ def bg_runner(proxy_task, task=None, *args, **kwargs):
     If a Task instance is provided, args and kwargs are ignored and retrieved from the Task itself.
     """
     signals.task_started.send(Task)
+    task_name = task.task_name if task is not None else str()
     try:
         func = getattr(proxy_task, 'task_function', None)
         if isinstance(task, Task):
@@ -58,13 +59,16 @@ def bg_runner(proxy_task, task=None, *args, **kwargs):
             signals.task_error.send(sender=ex.__class__, task=task)
             task.reschedule(t, e, traceback)
         del traceback
+
     signals.task_finished.send(Task)
+    return task_name
 
 
 class PoolRunner:
     def __init__(self, bg_runner, num_processes):
         self._bg_runner = bg_runner
         self._num_processes = num_processes
+        self._forced_sync_tasks = dict()
 
     _pool_instance = None
 
@@ -74,8 +78,23 @@ class PoolRunner:
             self._pool_instance = ThreadPool(processes=self._num_processes)
         return self._pool_instance
 
+    def on_task_completed(self, completed_task_name):
+        self._forced_sync_tasks.pop(completed_task_name, None)
+
     def run(self, proxy_task, task=None, *args, **kwargs):
-        self._pool.apply_async(func=self._bg_runner, args=(proxy_task, task) + tuple(args), kwds=kwargs)
+        if task is not None and task.force_synchronous_execution:
+            if self._forced_sync_tasks.get(task.task_name, False):
+                task.unlock()
+                return
+            else:
+                self._forced_sync_tasks[task.task_name] = True
+
+        self._pool.apply_async(
+            func=self._bg_runner,
+            args=(proxy_task, task) + tuple(args),
+            kwds=kwargs,
+            callback=self.on_task_completed
+        )
 
     __call__ = run
 
@@ -89,7 +108,7 @@ class Tasks(object):
         self._pool_runner = PoolRunner(bg_runner, app_settings.BACKGROUND_TASK_ASYNC_THREADS)
 
     def background(self, name=None, schedule=None, queue=None,
-                   remove_existing_tasks=False):
+                   remove_existing_tasks=False, force_synchronous_execution=False):
         '''
         decorator to turn a regular function into
         something that gets run asynchronously in
@@ -108,7 +127,8 @@ class Tasks(object):
             if not _name:
                 _name = '%s.%s' % (fn.__module__, fn.__name__)
             proxy = self._task_proxy_class(_name, fn, schedule, queue,
-                                           remove_existing_tasks, self._runner)
+                                           remove_existing_tasks, self._runner,
+                                           force_synchronous_execution)
             self._tasks[_name] = proxy
             return proxy
         if fn:
@@ -128,6 +148,7 @@ class Tasks(object):
         else:
             task = None
         proxy_task = self._tasks[task_name]
+
         if app_settings.BACKGROUND_TASK_RUN_ASYNC:
             self._pool_runner(proxy_task, task, *args, **kwargs)
         else:
@@ -216,11 +237,13 @@ class DBTaskRunner(object):
     def schedule(self, task_name, args, kwargs, run_at=None,
                  priority=0, action=TaskSchedule.SCHEDULE, queue=None,
                  verbose_name=None, creator=None,
-                 repeat=None, repeat_until=None, remove_existing_tasks=False):
+                 repeat=None, repeat_until=None, remove_existing_tasks=False,
+                 force_synchronous_execution=False):
         '''Simply create a task object in the database'''
         task = Task.objects.new_task(task_name, args, kwargs, run_at, priority,
                                      queue, verbose_name, creator, repeat,
-                                     repeat_until, remove_existing_tasks)
+                                     repeat_until, remove_existing_tasks,
+                                     force_synchronous_execution)
         if action != TaskSchedule.SCHEDULE:
             task_hash = task.task_hash
             now = timezone.now()
@@ -268,16 +291,21 @@ class DBTaskRunner(object):
 
 @python_2_unicode_compatible
 class TaskProxy(object):
-    def __init__(self, name, task_function, schedule, queue, remove_existing_tasks, runner):
+    def __init__(self, name, task_function, schedule, queue, remove_existing_tasks,
+                 runner, force_synchronous_execution):
         self.name = name
         self.now = self.task_function = task_function
         self.runner = runner
         self.schedule = TaskSchedule.create(schedule)
         self.queue = queue
         self.remove_existing_tasks = remove_existing_tasks
+        self.force_synchronous_execution = force_synchronous_execution
 
 
     def __call__(self, *args, **kwargs):
+        if kwargs.pop('force_synchronous_execution', False):
+            raise ValueError('You cannot override force_synchronous_execution when invoking task')
+
         schedule = kwargs.pop('schedule', None)
         schedule = TaskSchedule.create(schedule).merge(self.schedule)
         run_at = schedule.run_at
@@ -293,7 +321,7 @@ class TaskProxy(object):
         return self.runner.schedule(self.name, args, kwargs, run_at, priority,
                                     action, queue, verbose_name, creator,
                                     repeat, repeat_until,
-                                    remove_existing_tasks)
+                                    remove_existing_tasks, self.force_synchronous_execution)
 
     def __str__(self):
         return 'TaskProxy(%s)' % self.name

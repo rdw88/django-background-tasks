@@ -2,6 +2,7 @@
 import time
 from datetime import timedelta, datetime
 from mock import patch, Mock
+from multiprocessing.pool import ThreadPool
 
 from django.db.utils import OperationalError
 from django.contrib.auth.models import User
@@ -11,7 +12,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from background_task.exceptions import InvalidTaskError
-from background_task.tasks import tasks, TaskSchedule, TaskProxy
+from background_task.tasks import tasks, TaskSchedule, TaskProxy, PoolRunner
 from background_task.models import Task
 from background_task.models import CompletedTask
 from background_task import background
@@ -895,3 +896,185 @@ class DatabaseOutageTestCase(TransactionTestCase):
         self.assertTrue(mock_logger.warning.called)
         self.assertFalse(mock_logger.error.called)
         self.assertFalse(mock_logger.critical.called)
+
+
+class PoolRunnerTestCase(TransactionTestCase):
+    def setUp(self):
+        self.runner = PoolRunner(bg_runner=Mock(), num_processes=4)
+
+        self.thread_pool = Mock()
+        self.runner._pool_instance = self.thread_pool
+
+        self.proxy_task = Mock()
+        self.task = Mock()
+
+
+    def test_task_not_forcing_sync_execution_runs_on_thread_pool(self):
+        self.task.force_synchronous_execution = False
+
+        self.runner.run(self.proxy_task, self.task)
+
+        self.thread_pool.apply_async.assert_called_once_with(
+            func=self.runner._bg_runner,
+            args=(self.proxy_task, self.task),
+            kwds={},
+            callback=self.runner.on_task_completed
+        )
+
+        self.assertFalse(self.runner._forced_sync_tasks.get(self.task.task_name, False))
+
+
+    def test_null_task_runs_on_thread_pool(self):
+        self.runner.run(self.proxy_task, task=None)
+
+        self.thread_pool.apply_async.assert_called_once_with(
+            func=self.runner._bg_runner,
+            args=(self.proxy_task, None),
+            kwds={},
+            callback=self.runner.on_task_completed
+        )
+
+        self.assertEqual(len(self.runner._forced_sync_tasks), 0)
+
+
+    def test_forcing_sync_execution_tracks_task(self):
+        self.task.force_synchronous_execution = True
+
+        self.runner.run(self.proxy_task, self.task)
+
+        self.thread_pool.apply_async.assert_called_once_with(
+            func=self.runner._bg_runner,
+            args=(self.proxy_task, self.task),
+            kwds={},
+            callback=self.runner.on_task_completed
+        )
+
+        self.assertTrue(self.runner._forced_sync_tasks.get(self.task.task_name, False))
+
+
+    def test_forcing_sync_with_existing_tracked_task_does_not_run_task(self):
+        self.task.force_synchronous_execution = True
+        self.runner._forced_sync_tasks[self.task.task_name] = True
+
+        self.runner.run(self.proxy_task, self.task)
+
+        self.thread_pool.apply_async.assert_not_called()
+        self.assertTrue(self.runner._forced_sync_tasks.get(self.task.task_name, False))
+        self.task.unlock.assert_called_once()
+
+
+    def test_forcing_sync_still_runs_with_another_task_in_tracked_tasks(self):
+        self.task.force_synchronous_execution = True
+        self.runner._forced_sync_tasks['another_task'] = True
+
+        self.runner.run(self.proxy_task, self.task)
+
+        self.thread_pool.apply_async.assert_called_once_with(
+            func=self.runner._bg_runner,
+            args=(self.proxy_task, self.task),
+            kwds={},
+            callback=self.runner.on_task_completed
+        )
+
+        self.assertTrue(self.runner._forced_sync_tasks.get(self.task.task_name, False))
+
+
+    def test_apply_async_callback_resets_sync_tasks_tracker(self):
+        self.task.force_synchronous_execution = True
+
+        def apply_async(func, args, kwds, callback):
+            callback(args[1].task_name)
+
+        self.thread_pool.apply_async.side_effect = apply_async
+
+        self.runner.run(self.proxy_task, self.task)
+
+        self.assertFalse(self.runner._forced_sync_tasks.get(self.task.task_name, False))
+
+
+
+async_list = list()
+sync_list = list()
+
+@background(name='AsyncTask')
+def async_task():
+    async_list.append(1)
+    time.sleep(5)
+    async_list.remove(1)
+
+
+@background(name='ForceSyncTask', force_synchronous_execution=True)
+def sync_task():
+    sync_list.append(1)
+    time.sleep(5)
+    sync_list.remove(1)
+
+
+class ForceSyncExecutionTestCase(TransactionTestCase):
+    @override_settings(BACKGROUND_TASK_RUN_ASYNC=True)
+    def test_force_sync_execution(self):
+        """The following task queue is tested where "sync task" is forced to run
+        synchronously despite BACKGROUND_TASK_RUN_ASYNC being True. Each "sync task"
+        needs to wait until the existing task of its type is complete.
+
+        1. Run sync task #2
+            -> Expected to run in the thread pool
+        2. Run sync task #2
+            -> Expected to not run and wait for the first to complete
+        3. Run async task
+            -> Expected to run despite the first sync task still running
+        4. Attempt to run sync task #2 once sync task #1 completes
+            -> Expected to run
+        """
+        # Invoke and run the first sync task
+        sync_task()
+        run_next_task()
+
+        self.assertTrue(tasks._pool_runner._forced_sync_tasks.get('ForceSyncTask', False))
+        self.assertEqual(len(sync_list), 1)
+
+        # Queue both a sync and async task
+        sync_task()
+        async_task()
+
+        # Try to run the second sync task and verify it's not run
+        run_next_task()
+
+        self.assertTrue(tasks._pool_runner._forced_sync_tasks.get('ForceSyncTask', False))
+        self.assertEqual(len(sync_list), 1)
+        self.assertEqual(len(async_list), 0)
+
+        # Verify the sync task was moved lower in priority to let other async
+        # tasks to use up available worker threads. The async task should now
+        # get run
+        run_next_task()
+
+        self.assertTrue(tasks._pool_runner._forced_sync_tasks.get('ForceSyncTask', False))
+        self.assertEqual(len(sync_list), 1)
+        self.assertEqual(len(async_list), 1)
+
+        # Wait for the first sync task to complete
+        time.sleep(5)
+
+        # Verify the first sync task has completed and is removed from PoolRunner
+        self.assertFalse(tasks._pool_runner._forced_sync_tasks.get('ForceSyncTask', False))
+        self.assertEqual(len(sync_list), 0)
+        self.assertEqual(len(async_list), 0)
+
+        # Now try running the second sync task (the only task left in the queue)
+        run_next_task()
+
+        self.assertTrue(tasks._pool_runner._forced_sync_tasks.get('ForceSyncTask', False))
+        self.assertEqual(len(sync_list), 1)
+        self.assertEqual(len(async_list), 0)
+
+        time.sleep(5)
+
+        self.assertFalse(tasks._pool_runner._forced_sync_tasks.get('ForceSyncTask', False))
+        self.assertEqual(len(sync_list), 0)
+        self.assertEqual(len(async_list), 0)
+
+
+    def tearDown(self):
+        Task.objects.filter(task_name__in=['ForceSyncTask', 'AsyncTask']).delete()
+        CompletedTask.objects.filter(task_name__in=['ForceSyncTask', 'AsyncTask']).delete()
